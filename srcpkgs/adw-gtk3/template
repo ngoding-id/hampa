@@ -1,0 +1,16 @@
+pkgname=adw-gtk3
+version=6.5
+revision=1
+create_wrksrc=yes
+short_desc="The theme from libadwaita ported to GTK-3"
+maintainer="ngoding-id/hampa <album-lanky-dinner@duck.com>"
+license="LGPL-2.1-or-later"
+homepage="https://github.com/lassekongo83/adw-gtk3"
+distfiles="${homepage}/releases/download/v${version}/${pkgname}v${version}.tar.xz"
+checksum=a81780fadfc432be0fc3d89c4ebb41aa28e4f032d42c36f9789c57dd10cfa41c
+
+do_install() {
+	vmkdir usr/share/themes
+	vcopy adw-gtk3 usr/share/themes/
+	vcopy adw-gtk3-dark usr/share/themes/
+}

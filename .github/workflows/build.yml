@@ -1,0 +1,297 @@
+name: Build and publish XBPS repository
+
+# Builds the custom package templates kept in this repository's srcpkgs/ on top of
+# a fresh void-linux/void-packages checkout and publishes them as a signed XBPS
+# repository attached to a GitHub release.
+#
+# Optional configuration:
+#   secrets.XBPS_PRIVKEY     - RSA private key (PEM) used to sign the repo. When
+#                              absent, signing is skipped (fork-safe).
+#   secrets.XBPS_PASSPHRASE  - (optional) passphrase protecting the key.
+#   vars.XBPS_SIGNEDBY       - (optional) "signed-by" identity; defaults to the owner.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - srcpkgs/**
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build packages (${{ matrix.config.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - { arch: x86_64,      libc: glibc }
+    container:
+      image: ghcr.io/void-linux/void-glibc-full:20250901R1
+      options: --platform linux/amd64 --privileged
+      volumes:
+        - /dev:/dev
+      env:
+        ARCH: '${{ matrix.config.arch }}'
+        XBPS_TARGET_ARCH: '${{ matrix.config.arch }}'
+    if: ${{ github.ref == 'refs/heads/main' }}
+
+    steps:
+      - name: Prepare container
+        run: |
+          mkdir -p /etc/xbps.d && cp /usr/share/xbps.d/*-repository-*.conf /etc/xbps.d/
+          env -u XBPS_TARGET_ARCH xbps-install -Syu xbps
+          env -u XBPS_TARGET_ARCH xbps-install -yu
+          env -u XBPS_TARGET_ARCH xbps-install -y sudo bash curl grep jq git zip unzip github-cli xtools
+          useradd -m -G xbuilder builder -s "$(which bash)"
+
+      - name: Checkout void-packages
+        uses: actions/checkout@v6
+        with:
+          repository: void-linux/void-packages
+          ref: master
+
+      - name: Checkout this repository
+        uses: actions/checkout@v6
+        with:
+          path: _hampa
+
+      - name: Copy our package templates into void-packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The authoritative list of "our" packages = the directories we ship in
+          # srcpkgs/. Everything else in void-packages stays untouched and is never
+          # built from source (only pulled in as binary dependencies).
+          our_pkgs=$(ls -1 _hampa/srcpkgs)
+          echo "Our packages:"; echo "${our_pkgs}"
+          cp -r _hampa/srcpkgs/* srcpkgs/
+          printf '%s\n' "${our_pkgs}" > /tmp/our_pkgs.list
+
+      - name: Setup void-packages
+        run: |
+          git config --global --add safe.directory "*"
+          chown -R builder:builder .
+          echo XBPS_BUILD_ENVIRONMENT=void-packages-ci >> etc/conf
+          echo XBPS_ALLOW_RESTRICTED=yes >> etc/conf
+          echo XBPS_CHROOT_CMD=uchroot >> etc/conf
+          yes | sudo -Eu builder ./xbps-src -m masterdir-${ARCH} -A ${ARCH} binary-bootstrap
+
+      - name: Fetch current release and resolve packages to build
+        id: select
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p prev hostdir/binpkgs
+
+          # Pull the packages of the current "latest" release, if any.
+          if tag=$(gh release view --json tagName -q .tagName 2>/dev/null); then
+            echo "Previous release: $tag"
+            gh release download "$tag" -D prev -p '*.xbps' || true
+          else
+            echo "No previous release found; starting fresh."
+          fi
+
+          # Keep only packages relevant to this architecture (plus noarch).
+          if [ "$ARCH" = "x86_64" ]; then
+            rm -f prev/*.x86_64-musl.xbps
+          elif [ "$ARCH" = "x86_64-musl" ]; then
+            rm -f prev/*.x86_64.xbps
+          fi
+
+          # Carry previously published packages forward so each release stays a
+          # complete repository and inter-package deps keep resolving locally.
+          if ls prev/*.xbps >/dev/null 2>&1; then
+            cp -f prev/*.xbps hostdir/binpkgs/
+          fi
+          chown -R builder:builder hostdir prev
+          if ls hostdir/binpkgs/*.xbps >/dev/null 2>&1; then
+            sudo -Eu builder xbps-rindex -a hostdir/binpkgs/*.xbps || true
+          fi
+
+          # Decide what to (re)build: build only OUR packages, and only when the
+          # exact <pkgver>.<arch>.xbps (or .noarch.xbps) is not already published.
+          : > /tmp/build.list
+          while read -r pkg; do
+            [ -n "$pkg" ] || continue
+            [ -f "srcpkgs/$pkg/template" ] || continue
+
+            # Skip packages not buildable for this architecture.
+            sudo -Eu builder ./xbps-src -m masterdir-${ARCH} -A ${ARCH} show-avail "$pkg" >/dev/null 2>&1 || {
+              echo "skip (arch): $pkg"; continue; }
+
+            pkgver=$(sudo -Eu builder ./xbps-src -m masterdir-${ARCH} -A ${ARCH} show "$pkg" 2>/dev/null | awk '
+              /^pkgname:/{n=$2} /^version:/{v=$2} /^revision:/{r=$2}
+              END{ if (n && v && r) print n"-"v"_"r }')
+            [ -n "$pkgver" ] || { echo "skip (no pkgver): $pkg"; continue; }
+
+            if [ -f "prev/${pkgver}.${ARCH}.xbps" ] || [ -f "prev/${pkgver}.noarch.xbps" ]; then
+              echo "up-to-date: ${pkgver}"
+            else
+              echo "to build:   ${pkgver}"
+              echo "$pkg" >> /tmp/build.list
+            fi
+          done < /tmp/our_pkgs.list
+
+          count=$(wc -l < /tmp/build.list | tr -d ' ')
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "Packages to build: $count"
+
+      - name: Build packages
+        if: steps.select.outputs.count != '0'
+        shell: bash
+        run: |
+          set -euo pipefail
+          while read -r pkg; do
+            [ -n "$pkg" ] || continue
+            echo "::group::Building $pkg"
+            sudo -Eu builder ./xbps-src pkg -j"$(nproc)" -m masterdir-${ARCH} -A ${ARCH} "$pkg" \
+              || printf 'Failed building %s!\n' "$pkg"
+            echo "::endgroup::"
+          done < /tmp/build.list
+
+      - name: Record build count
+        run: |
+          mkdir -p _meta
+          printf '%s' "${{ steps.select.outputs.count }}" > "_meta/${ARCH}.count"
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.config.arch }}-repodata
+          path: ./hostdir/binpkgs
+
+      - name: Upload build-count artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.config.arch }}-meta
+          path: ./_meta
+
+  publish:
+    name: Assemble, sign and publish release
+    needs: build
+    runs-on: ubuntu-latest
+    if: ${{ github.ref == 'refs/heads/main' }}
+    container:
+      image: ghcr.io/void-linux/void-glibc-full:20250901R1
+      options: --platform linux/amd64 --privileged
+    env:
+      GH_TOKEN: ${{ github.token }}
+      XBPS_PASSPHRASE: ${{ secrets.XBPS_PASSPHRASE }}
+      XBPS_SIGNEDBY: ${{ vars.XBPS_SIGNEDBY }}
+
+    steps:
+      - name: Prepare container
+        run: |
+          mkdir -p /etc/xbps.d && cp /usr/share/xbps.d/*-repository-*.conf /etc/xbps.d/
+          env -u XBPS_TARGET_ARCH xbps-install -Syu xbps
+          env -u XBPS_TARGET_ARCH xbps-install -yu
+          env -u XBPS_TARGET_ARCH xbps-install -y bash curl coreutils git github-cli
+
+      - name: Checkout this repository
+        uses: actions/checkout@v6
+
+      - name: Mark workspace as safe for git
+        run: git config --global --add safe.directory "*"
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: _artifacts
+
+      - name: Aggregate build counts
+        id: gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          total=0
+          for f in _artifacts/*-meta/*.count; do
+            [ -f "$f" ] || continue
+            c=$(cat "$f" 2>/dev/null || echo 0)
+            c=${c:-0}
+            total=$((total + c))
+          done
+          echo "Total packages built across all arches: $total"
+          echo "total=$total" >> "$GITHUB_OUTPUT"
+
+      - name: Assemble, index and prune repository
+        if: steps.gate.outputs.total != '0'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Collect every built / carried-forward package from both arches into a
+          # single flat repo dir (identical filenames, e.g. noarch, dedupe on copy).
+          rm -rf repo && mkdir -p repo
+          find _artifacts -path '*-repodata/*' -name '*.xbps' -exec cp -f {} repo/ \;
+
+          # Regenerate the index, then drop superseded packages so the release
+          # contains exactly what the index references.
+          xbps-rindex -a repo/*.xbps
+          xbps-rindex --remove-obsoletes repo
+
+      - name: Sign repository
+        if: steps.gate.outputs.total != '0'
+        env:
+          XBPS_PRIVKEY: ${{ secrets.XBPS_PRIVKEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${XBPS_PRIVKEY}" ]; then
+            printf '%s' "${XBPS_PRIVKEY}" > privkey.pem
+            chmod 600 privkey.pem
+            signedby="${XBPS_SIGNEDBY:-$GITHUB_REPOSITORY_OWNER}"
+            xbps-rindex --sign --signedby "$signedby" --privkey privkey.pem repo
+            xbps-rindex --sign-pkg --privkey privkey.pem repo/*.xbps
+            rm -f privkey.pem
+          else
+            echo "No XBPS_PRIVKEY secret set. Skipping cryptographic signing (normal for forks)."
+          fi
+
+      - name: Generate checksums
+        if: steps.gate.outputs.total != '0'
+        working-directory: ./repo
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f *.sha256sum *.sha512sum
+          for file in *.xbps; do
+            [ -e "$file" ] || continue
+            sha256sum "$file" | cut -d ' ' -f 1 > "${file}.sha256sum"
+            sha512sum "$file" | cut -d ' ' -f 1 > "${file}.sha512sum"
+          done
+
+      - name: Attach committed public key
+        if: steps.gate.outputs.total != '0'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ls repo-keys/*/*.plist >/dev/null 2>&1; then
+            cp -f repo-keys/*/*.plist repo/
+          else
+            echo "WARNING: no committed public key found under repo-keys/; users will" \
+                 "have to accept the key import prompt on first install."
+          fi
+
+      - name: Publish release
+        if: steps.gate.outputs.total != '0'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="build-$(date -u +%Y%m%d-%H%M%S)"
+
+          # Assets: repodata + packages + signatures + checksums + public key.
+          gh release create "$tag" \
+            --latest \
+            --title "$tag" \
+            --notes "Automated XBPS repository build. Add it with: repository=https://github.com/${GITHUB_REPOSITORY}/releases/latest/download" \
+            repo/*
